@@ -2714,6 +2714,12 @@ bool fuse_set_conn_flag(struct fuse_conn_info *conn, uint64_t flag)
 	}
 }
 
+/* Out-of-tree kernel server-recovery capability (must match the kernel's
+ * include/uapi/linux/fuse.h). */
+#ifndef FUSE_HAS_RECOVERY
+#define FUSE_HAS_RECOVERY	(1ULL << 40)
+#endif
+
 /* Prevent bogus data races (bogus since "init" is called before
  * multi-threading becomes relevant */
 static __attribute__((no_sanitize("thread"))) void
@@ -3049,6 +3055,11 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 			enable_io_uring = false;
 		}
 	}
+
+	/* Prototype: echo the kernel's server-recovery capability so the
+	 * connection is kept alive across a daemon crash (out-of-tree kernel). */
+	if (inargflags & FUSE_HAS_RECOVERY)
+		outargflags |= FUSE_HAS_RECOVERY;
 
 	if (inargflags & FUSE_INIT_EXT) {
 		outargflags |= FUSE_INIT_EXT;
@@ -5128,6 +5139,25 @@ out:
 error_out:
 	free(mountpoint);
 	return -1;
+}
+
+void fuse_session_recover(struct fuse_session *se)
+{
+	/*
+	 * After FUSE_DEV_IOC_ATTACH the kernel keeps the previously negotiated
+	 * connection alive and does NOT resend FUSE_INIT.  Mark the session as
+	 * initialized and restore the default negotiation result so it is
+	 * immediately usable.  Prototype: assumes the default FUSE_INIT
+	 * negotiation; production should persist/restore the real parameters.
+	 */
+	se->got_init = 1;
+	se->conn.proto_major = FUSE_KERNEL_VERSION;
+	se->conn.proto_minor = FUSE_KERNEL_MINOR_VERSION;
+	/* Must match the default negotiated by fuse_session_new()/do_init(),
+	 * otherwise the read buffer is smaller than fc->max_write and the
+	 * kernel rejects device reads with -EINVAL. */
+	se->conn.max_write = FUSE_DEFAULT_MAX_PAGES_LIMIT * pagesize;
+	se->bufsize = se->conn.max_write + FUSE_BUFFER_HEADER_SIZE;
 }
 
 int fuse_session_fd(const struct fuse_session *se)

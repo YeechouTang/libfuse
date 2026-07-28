@@ -51,6 +51,18 @@
 
 #include "passthrough_helpers.h"
 
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <fuse_kernel.h>
+
+/* Re-attach to a kept-alive fuse connection.  Out-of-tree kernel feature;
+ * this must match the kernel's include/uapi/linux/fuse.h definition. */
+struct fuse_ioctl_attach {
+#define FUSE_TAG_NAME_MAX	128
+	char	tag[FUSE_TAG_NAME_MAX];
+};
+#define FUSE_DEV_IOC_ATTACH	_IOW(FUSE_DEV_IOC_MAGIC, 3, struct fuse_ioctl_attach)
+
 /* We are re-using pointers to our `struct lo_inode` and `struct
    lo_dirp` elements as inodes. This means that we must be able to
    store uintptr_t values in a fuse_ino_t variable. The following
@@ -89,6 +101,8 @@ struct lo_data {
 	double timeout;
 	int cache;
 	int timeout_set;
+	int recover;		/* re-attach to a kept-alive connection */
+	const char *tag;	/* connection tag used for --recover */
 	struct lo_inode root; /* protected by lo->mutex */
 };
 
@@ -99,6 +113,10 @@ static const struct fuse_opt lo_opts[] = {
 	  offsetof(struct lo_data, writeback), 0 },
 	{ "source=%s",
 	  offsetof(struct lo_data, source), 0 },
+	{ "--recover",
+	  offsetof(struct lo_data, recover), 1 },
+	{ "--tag=%s",
+	  offsetof(struct lo_data, tag), 0 },
 	{ "flock",
 	  offsetof(struct lo_data, flock), 1 },
 	{ "no_flock",
@@ -1317,15 +1335,16 @@ int main(int argc, char *argv[])
 		goto err_out1;
 	}
 
-	if(opts.mountpoint == NULL) {
+	if (fuse_opt_parse(&args, &lo, lo_opts, NULL)== -1)
+		return 1;
+
+	/* In --recover mode no mountpoint is given; we re-attach instead. */
+	if (!lo.recover && opts.mountpoint == NULL) {
 		printf("usage: %s [options] <mountpoint>\n", argv[0]);
 		printf("       %s --help\n", argv[0]);
 		ret = 1;
 		goto err_out1;
 	}
-
-	if (fuse_opt_parse(&args, &lo, lo_opts, NULL)== -1)
-		return 1;
 
 	lo.debug = opts.debug;
 	lo.root.refcount = 2;
@@ -1385,7 +1404,37 @@ int main(int argc, char *argv[])
 	if (fuse_set_signal_handlers(se) != 0)
 	    goto err_out2;
 
-	if (fuse_session_mount(se, opts.mountpoint) != 0)
+	if (lo.recover) {
+		/* Re-attach to the kept-alive connection and resume service
+		 * without a new FUSE_INIT negotiation. */
+		char mp[32];
+		struct fuse_ioctl_attach attach = {};
+		struct fuse_out_header resend = {
+			.len = sizeof(resend),
+			.error = FUSE_NOTIFY_RESEND,
+			.unique = 0,
+		};
+		int fd = open("/dev/fuse", O_RDWR);
+
+		if (fd == -1) {
+			fuse_log(FUSE_LOG_ERR, "open(/dev/fuse): %m\n");
+			goto err_out3;
+		}
+		strncpy(attach.tag, lo.tag ? lo.tag : "", FUSE_TAG_NAME_MAX - 1);
+		if (ioctl(fd, FUSE_DEV_IOC_ATTACH, &attach) != 0) {
+			fuse_log(FUSE_LOG_ERR, "FUSE_DEV_IOC_ATTACH: %m\n");
+			close(fd);
+			goto err_out3;
+		}
+		snprintf(mp, sizeof(mp), "/dev/fd/%d", fd);
+		if (fuse_session_mount(se, mp) != 0)
+			goto err_out3;
+		fuse_session_recover(se);
+		/* Ask the kernel to resend the requests that were in flight
+		 * when the previous daemon crashed. */
+		if (write(fd, &resend, sizeof(resend)) != sizeof(resend))
+			fuse_log(FUSE_LOG_ERR, "FUSE_NOTIFY_RESEND: %m\n");
+	} else if (fuse_session_mount(se, opts.mountpoint) != 0)
 	    goto err_out3;
 
 	fuse_daemonize(opts.foreground);
@@ -1402,7 +1451,8 @@ int main(int argc, char *argv[])
 		config = NULL;
 	}
 
-	fuse_session_unmount(se);
+	if (!lo.recover)
+		fuse_session_unmount(se);
 err_out3:
 	fuse_remove_signal_handlers(se);
 err_out2:

@@ -2293,6 +2293,16 @@ static inline int fuse_session_custom_io(struct fuse_session *se,
 int fuse_session_mount(struct fuse_session *se, const char *mountpoint);
 
 /**
+ * Mark a session as recovered after re-attaching to a kept-alive fuse
+ * connection (e.g. via a FUSE_DEV_IOC_ATTACH ioctl on a freshly opened
+ * /dev/fuse).  The kernel does not resend FUSE_INIT in this case, so this
+ * restores the negotiation state and marks the session initialized.
+ *
+ * @param se session object
+ **/
+void fuse_session_recover(struct fuse_session *se);
+
+/**
  * Enter a single threaded, blocking event loop.
  *
  * When the event loop terminates because the connection to the FUSE

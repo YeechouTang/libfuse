@@ -64,6 +64,7 @@ static const struct fuse_opt fuse_mount_opts[] = {
 	FUSE_OPT_KEY("subtype=",		KEY_SUBTYPE_OPT),
 	FUSE_OPT_KEY("blksize=",		KEY_KERN_OPT),
 	FUSE_OPT_KEY("default_permissions",	KEY_KERN_OPT),
+	FUSE_OPT_KEY("tag=",			KEY_KERN_OPT),
 	FUSE_OPT_KEY("context=",		KEY_KERN_OPT),
 	FUSE_OPT_KEY("fscontext=",		KEY_KERN_OPT),
 	FUSE_OPT_KEY("defcontext=",		KEY_KERN_OPT),
