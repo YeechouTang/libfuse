@@ -161,10 +161,24 @@ static struct lo_data *lo_data(fuse_req_t req)
 	return (struct lo_data *) fuse_req_userdata(req);
 }
 
+/*
+ * Prototype crash-recovery test hack (single file only).
+ *
+ * A restarted daemon has none of the previous daemon's runtime state, so the
+ * pointer-based nodeids it receives would be dereferenced as wild pointers
+ * (segfault) -- this is the daemon-side "recover your own state" limitation.
+ * For the single-file fio write test we sidestep it: every non-root nodeid is
+ * mapped to one fixed inode backed by "testfile" under the source dir, opened
+ * once when the recovered daemon starts.
+ */
+static struct lo_inode lo_recover_inode = { .fd = -1 };
+
 static struct lo_inode *lo_inode(fuse_req_t req, fuse_ino_t ino)
 {
 	if (ino == FUSE_ROOT_ID)
 		return &lo_data(req)->root;
+	else if (lo_data(req)->recover)
+		return &lo_recover_inode;
 	else
 		return (struct lo_inode *) (uintptr_t) ino;
 }
@@ -945,6 +959,11 @@ static void lo_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi
 {
 	(void) ino;
 
+	/* recover mode: fi->fh is stale, closing it could hit our own fd */
+	if (lo_data(req)->recover) {
+		fuse_reply_err(req, 0);
+		return;
+	}
 	close(fi->fh);
 	fuse_reply_err(req, 0);
 }
@@ -953,6 +972,11 @@ static void lo_flush(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
 	int res;
 	(void) ino;
+	/* recover mode: fi->fh is stale, skip the flush */
+	if (lo_data(req)->recover) {
+		fuse_reply_err(req, 0);
+		return;
+	}
 	res = close(dup(fi->fh));
 	fuse_reply_err(req, res == -1 ? errno : 0);
 }
@@ -989,12 +1013,13 @@ static void lo_write_buf(fuse_req_t req, fuse_ino_t ino,
 			 struct fuse_bufvec *in_buf, off_t off,
 			 struct fuse_file_info *fi)
 {
-	(void) ino;
 	ssize_t res;
 	struct fuse_bufvec out_buf = FUSE_BUFVEC_INIT(fuse_buf_size(in_buf));
 
 	out_buf.buf[0].flags = FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK;
-	out_buf.buf[0].fd = fi->fh;
+	/* recover mode: fi->fh from the crashed daemon is stale, use the fixed
+	 * inode's freshly opened fd instead. */
+	out_buf.buf[0].fd = lo_data(req)->recover ? lo_fd(req, ino) : fi->fh;
 	out_buf.buf[0].pos = off;
 
 	if (lo_debug(req))
@@ -1430,6 +1455,13 @@ int main(int argc, char *argv[])
 		if (fuse_session_mount(se, mp) != 0)
 			goto err_out3;
 		fuse_session_recover(se);
+		/* single-file test: open the one backing file up front so the
+		 * replayed writes have a valid fd (see lo_recover_inode). */
+		lo_recover_inode.fd = openat(lo.root.fd, "testfile", O_RDWR);
+		if (lo_recover_inode.fd == -1) {
+			fuse_log(FUSE_LOG_ERR, "recover: openat(testfile): %m\n");
+			goto err_out3;
+		}
 		/* Ask the kernel to resend the requests that were in flight
 		 * when the previous daemon crashed. */
 		if (write(fd, &resend, sizeof(resend)) != sizeof(resend))
